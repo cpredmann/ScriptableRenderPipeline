@@ -307,9 +307,9 @@ namespace UnityEngine.Rendering.HighDefinition
 
         // This function relies on being called once per camera per frame.
         // The results are undefined otherwise.
-        internal void UpdateVolumetricBufferParams(HDCamera hdCamera)
+        internal void UpdateVolumetricBufferParams(HDCamera hdCamera, bool ignoreVolumeStack)
         {
-            if (!Fog.IsVolumetricFogEnabled(hdCamera))
+            if (!Fog.IsVolumetricFogEnabled(hdCamera, ignoreVolumeStack))
                 return;
 
             var parameters = ComputeVBufferParameters(hdCamera);

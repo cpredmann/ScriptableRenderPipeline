@@ -274,6 +274,8 @@ namespace UnityEngine.Rendering.HighDefinition
         // Otherwise, previous frame view constants will be wrong.
         public void Update(FrameSettings currentFrameSettings, HDRenderPipeline hdrp, MSAASamples msaaSamples, XRPass xrPass)
         {
+            bool ignoreVolumeStack = true; // Unfortunately, it is initialized after this function call
+
             // store a shortcut on HDAdditionalCameraData (done here and not in the constructor as
             // we don't create HDCamera at every frame and user can change the HDAdditionalData later (Like when they create a new scene).
             camera.TryGetComponent<HDAdditionalCameraData>(out m_AdditionalCameraData);
@@ -285,8 +287,6 @@ namespace UnityEngine.Rendering.HighDefinition
 
             // Handle memory allocation.
             {
-                bool ignoreVolumeStack = true; // Unfortunately, it is initialized after this function call
-
                 // Have to do this every frame in case the settings have changed.
                 // The condition inside controls whether we perform init/deinit or not.
                 hdrp.ReinitializeVolumetricBufferParams(this, ignoreVolumeStack);
@@ -364,7 +364,7 @@ namespace UnityEngine.Rendering.HighDefinition
             UpdateAllViewConstants();
             isFirstFrame = false;
 
-            hdrp.UpdateVolumetricBufferParams(this);
+            hdrp.UpdateVolumetricBufferParams(this, ignoreVolumeStack);
 
             UpdateVolumeParameters();
 
