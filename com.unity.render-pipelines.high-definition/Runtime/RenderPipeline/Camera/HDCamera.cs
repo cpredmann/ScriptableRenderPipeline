@@ -283,14 +283,14 @@ namespace UnityEngine.Rendering.HighDefinition
 
             UpdateAntialiasing();
 
-            bool ignoreVolumeStack = true; // Unfortunately, it is initialized after this function call
-
-            // Have to do this every frame in case the settings have changed.
-            // The condition inside controls whether we perform init/deinit or not.
-            hdrp.ReinitializeVolumetricBufferParams(this, ignoreVolumeStack);
-
             // Handle memory allocation.
             {
+                bool ignoreVolumeStack = true; // Unfortunately, it is initialized after this function call
+
+                // Have to do this every frame in case the settings have changed.
+                // The condition inside controls whether we perform init/deinit or not.
+                hdrp.ReinitializeVolumetricBufferParams(this, ignoreVolumeStack);
+
                 bool isCurrentColorPyramidRequired = m_frameSettings.IsEnabled(FrameSettingsField.RoughRefraction) || m_frameSettings.IsEnabled(FrameSettingsField.Distortion);
                 bool isHistoryColorPyramidRequired = m_frameSettings.IsEnabled(FrameSettingsField.SSR) || antialiasing == AntialiasingMode.TemporalAntialiasing;
                 bool isVolumetricHistoryRequired   = IsVolumetricReprojectionEnabled(ignoreVolumeStack);
