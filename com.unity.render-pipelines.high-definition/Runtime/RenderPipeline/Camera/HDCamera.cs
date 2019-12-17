@@ -64,7 +64,7 @@ namespace UnityEngine.Rendering.HighDefinition
         public bool colorPyramidHistoryIsValid = false;
         public bool volumetricHistoryIsValid   = false; // Contains garbage otherwise
         public int  colorPyramidHistoryMipCount = 0;
-        public VBufferParameters[] vBufferParams; // Double-buffered
+        public VBufferParameters[] vBufferParams; // Double-buffered; needed even if reprojection is off
 
         float m_AmbientOcclusionResolutionScale = 0.0f; // Factor used to track if history should be reallocated for Ambient Occlusion
 
@@ -263,11 +263,9 @@ namespace UnityEngine.Rendering.HighDefinition
             return m_NeedTAAResetHistory;
         }
 
-        public bool IsVolumetricReprojectionEnabled()
+        internal bool IsVolumetricReprojectionEnabled(bool ignoreVolumeStack = false)
         {
-            return Application.isPlaying && camera.cameraType == CameraType.Game &&
-                   frameSettings.IsEnabled(FrameSettingsField.Volumetrics) &&
-                   frameSettings.IsEnabled(FrameSettingsField.ReprojectionForVolumetrics);
+            return Fog.IsVolumetricFogEnabled(this, ignoreVolumeStack) && camera.cameraType == CameraType.Game && Application.isPlaying;
         }
 
         // Pass all the systems that may want to update per-camera data here.
@@ -285,11 +283,17 @@ namespace UnityEngine.Rendering.HighDefinition
 
             UpdateAntialiasing();
 
+            bool ignoreVolumeStack = true; // Unfortunately, it is initialized after this function call
+
+            // Have to do this every frame in case the settings have changed.
+            // The condition inside controls whether we perform init/deinit or not.
+            hdrp.ReinitializeVolumetricBufferParams(this, ignoreVolumeStack);
+
             // Handle memory allocation.
             {
                 bool isCurrentColorPyramidRequired = m_frameSettings.IsEnabled(FrameSettingsField.RoughRefraction) || m_frameSettings.IsEnabled(FrameSettingsField.Distortion);
                 bool isHistoryColorPyramidRequired = m_frameSettings.IsEnabled(FrameSettingsField.SSR) || antialiasing == AntialiasingMode.TemporalAntialiasing;
-                bool isVolumetricHistoryRequired   = IsVolumetricReprojectionEnabled();
+                bool isVolumetricHistoryRequired   = IsVolumetricReprojectionEnabled(ignoreVolumeStack);
 
                 int numColorPyramidBuffersRequired = 0;
                 if (isCurrentColorPyramidRequired)
@@ -300,11 +304,11 @@ namespace UnityEngine.Rendering.HighDefinition
                 int numVolumetricBuffersRequired = isVolumetricHistoryRequired ? 2 : 0; // History + feedback
 
                 if ((m_NumColorPyramidBuffersAllocated != numColorPyramidBuffersRequired) ||
-                    (m_NumVolumetricBuffersAllocated != numVolumetricBuffersRequired))
+                    (m_NumVolumetricBuffersAllocated   != numVolumetricBuffersRequired))
                 {
                     // Reinit the system.
                     colorPyramidHistoryIsValid = false;
-                    hdrp.DeinitializeVolumetricLightingPerCameraData(this);
+                    volumetricHistoryIsValid   = false;
 
                     // The history system only supports the "nuke all" option.
                     m_HistoryRTSystem.Dispose();
@@ -313,20 +317,16 @@ namespace UnityEngine.Rendering.HighDefinition
                     if (numColorPyramidBuffersRequired != 0)
                     {
                         AllocHistoryFrameRT((int)HDCameraFrameHistoryType.ColorBufferMipChain, HistoryBufferAllocatorFunction, numColorPyramidBuffersRequired);
-                        colorPyramidHistoryIsValid = false;
                     }
 
-                    hdrp.InitializeVolumetricLightingHistoryPerCamera(this, numVolumetricBuffersRequired);
+                    if (numVolumetricBuffersRequired != 0)
+                    {
+                        hdrp.AllocateVolumetricHistoryBuffers(this, numVolumetricBuffersRequired);
+                    }
 
                     // Mark as init.
                     m_NumColorPyramidBuffersAllocated = numColorPyramidBuffersRequired;
-                    m_NumVolumetricBuffersAllocated = numVolumetricBuffersRequired;
-                }
-
-                // Init the vbuffer params if were never initialized
-                if(vBufferParams == null)
-                {
-                    hdrp.InitializeVBufferParameters(this);
+                    m_NumVolumetricBuffersAllocated   = numVolumetricBuffersRequired;
                 }
             }
 
@@ -364,7 +364,7 @@ namespace UnityEngine.Rendering.HighDefinition
             UpdateAllViewConstants();
             isFirstFrame = false;
 
-            hdrp.UpdateVolumetricLightingPerCameraData(this);
+            hdrp.UpdateVolumetricBufferParams(this);
 
             UpdateVolumeParameters();
 
