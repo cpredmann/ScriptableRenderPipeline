@@ -265,10 +265,12 @@ namespace UnityEngine.Rendering.HighDefinition
 
         internal bool IsVolumetricReprojectionEnabled(bool ignoreVolumeStack = false)
         {
-            return Fog.IsVolumetricFogEnabled(this, ignoreVolumeStack) &&
-                       frameSettings.IsEnabled(FrameSettingsField.ReprojectionForVolumetrics) &&
-                       camera.cameraType == CameraType.Game &&
-                       Application.isPlaying;
+            bool a = Fog.IsVolumetricFogEnabled(this, ignoreVolumeStack);
+            bool b = frameSettings.IsEnabled(FrameSettingsField.ReprojectionForVolumetrics);
+            bool c = camera.cameraType == CameraType.Game;
+            bool d = Application.isPlaying;
+
+            return a && b && c && d;
         }
 
         // Pass all the systems that may want to update per-camera data here.
