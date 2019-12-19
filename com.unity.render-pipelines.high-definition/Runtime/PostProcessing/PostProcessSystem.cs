@@ -4,13 +4,22 @@ using System.Runtime.CompilerServices;
 using UnityEngine.Assertions;
 using UnityEngine.Experimental.Rendering;
 
+
 namespace UnityEngine.Rendering.HighDefinition
 {
     using AntialiasingMode = HDAdditionalCameraData.AntialiasingMode;
 
+    public delegate void PostProcessCommand(CommandBuffer cmd, HDCamera cam, RTHandle source, ref RTHandle dest, bool taaEnabled, bool isSceneView);
+
+    public class PostProcess
+    {
+        public string name;
+        public PostProcessCommand command;
+    }
+
     // Main class for all post-processing related features - only includes camera effects, no
     // lighting/surface effect like SSR/AO
-    sealed class PostProcessSystem
+    public sealed class PostProcessSystem
     {
         private enum SMAAStage
         {
@@ -125,6 +134,8 @@ namespace UnityEngine.Rendering.HighDefinition
 
         HDRenderPipeline m_HDInstance;
 
+        private List<PostProcess> m_ReorderableCommands;
+
         public PostProcessSystem(HDRenderPipelineAsset hdAsset, RenderPipelineResources defaultResources)
         {
             m_Resources = defaultResources;
@@ -221,6 +232,30 @@ namespace UnityEngine.Rendering.HighDefinition
             }
 
             ResetHistory();
+
+            m_ReorderableCommands = new List<PostProcess>();
+            /*
+            {
+                new PostProcess{ name = "Lens Distortion", command = this.RenderLensDistortion },
+                new PostProcess{ name = "Color Grading", command = this.RenderColorGrading },
+                new PostProcess{ name = "Depth of Field", command = this.RenderDepthOfField},
+                new PostProcess{ name = "Motion Blur", command = this.RenderMotionBlur},
+                new PostProcess{ name = "Panini Projection", command = this.RenderPaniniProjection },
+                new PostProcess{ name = "Vignette", command = this.RenderVignette },
+                new PostProcess{ name = "Chromatic Aberration", command = this.RenderChromaticAberration },
+                new PostProcess{ name = "Bloom", command = this.RenderBloom },
+            };
+            */
+        }
+
+        public void SetPostProcessOrder(List<PostProcess> postProcesses)
+        {
+            m_ReorderableCommands = postProcesses;
+        }
+
+        public void ClearPostProcesses()
+        {
+            m_ReorderableCommands.Clear();
         }
 
         public void Cleanup()
@@ -361,6 +396,234 @@ namespace UnityEngine.Rendering.HighDefinition
             src = dst;
         }
 
+        public void RenderPaniniProjection(CommandBuffer cmd, HDCamera camera, RTHandle colorBuffer, ref RTHandle source, bool taaEnabled, bool isSceneView)
+        {
+            void PoolSource(ref RTHandle src, RTHandle dst)
+            {
+                PoolSourceGuard(ref src, dst, colorBuffer);
+            }
+
+            // Panini projection is done as a fullscreen pass after all depth-based effects are
+            // done and before bloom kicks in
+            // This is one effect that would benefit from an overscan mode or supersampling in
+            // HDRP to reduce the amount of resolution lost at the center of the screen
+            if (m_PaniniProjection.IsActive() && !isSceneView && m_PaniniProjectionFS)
+            {
+                using (new ProfilingSample(cmd, "Panini Projection", CustomSamplerId.PaniniProjection.GetSampler()))
+                {
+                    var destination = m_Pool.Get(Vector2.one, k_ColorFormat);
+                    DoPaniniProjection(cmd, camera, source, destination);
+                    PoolSource(ref source, destination);
+                }
+            }
+        }
+
+        public void RenderMotionBlur(CommandBuffer cmd, HDCamera camera, RTHandle colorBuffer, ref RTHandle source, bool taaEnabled, bool isSceneView)
+        {
+
+            void PoolSource(ref RTHandle src, RTHandle dst)
+            {
+                PoolSourceGuard(ref src, dst, colorBuffer);
+            }
+
+            if (m_MotionBlur.IsActive() && m_AnimatedMaterialsEnabled && !m_ResetHistory && m_MotionBlurFS)
+            {
+                using (new ProfilingSample(cmd, "Motion Blur", CustomSamplerId.MotionBlur.GetSampler()))
+                {
+                    var destination = m_Pool.Get(Vector2.one, k_ColorFormat);
+                    DoMotionBlur(cmd, camera, source, destination);
+                    PoolSource(ref source, destination);
+                }
+            }
+        }
+
+        public void RenderDepthOfField(CommandBuffer cmd, HDCamera camera, RTHandle colorBuffer, ref RTHandle source, bool taaEnabled, bool isSceneView)
+        {
+            void PoolSource(ref RTHandle src, RTHandle dst)
+            {
+                PoolSourceGuard(ref src, dst, colorBuffer);
+            }
+
+            // Depth of Field is done right after TAA as it's easier to just re-project the CoC
+            // map rather than having to deal with all the implications of doing it before TAA
+            if (m_DepthOfField.IsActive() && !isSceneView && m_DepthOfFieldFS)
+            {
+                using (new ProfilingSample(cmd, "Depth of Field", CustomSamplerId.DepthOfField.GetSampler()))
+                {
+                    var destination = m_Pool.Get(Vector2.one, k_ColorFormat);
+                    DoDepthOfField(cmd, camera, source, destination, taaEnabled);
+                    PoolSource(ref source, destination);
+                }
+            }
+        }
+
+        public void RenderLensDistortion(CommandBuffer cmd, HDCamera camera, RTHandle colorBuffer, ref RTHandle source, bool taaEnabled, bool isSceneView)
+        {
+            if (m_LensDistortion.IsActive())
+            {
+                void PoolSource(ref RTHandle src, RTHandle dst)
+                {
+                    PoolSourceGuard(ref src, dst, colorBuffer);
+                }
+
+                var cs = m_Resources.shaders.uberPostCS;
+                int kernel = GetUberKernel(cs, UberPostFeatureFlags.LensDistortion);
+
+                DoLensDistortion(cmd, cs, kernel, UberPostFeatureFlags.LensDistortion);
+
+                // Run
+                var destination = m_Pool.Get(Vector2.one, k_ColorFormat);
+
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._BloomTexture, TextureXR.GetBlackTexture());
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._BloomDirtTexture, Texture2D.blackTexture);
+                cmd.SetComputeVectorParam(cs, HDShaderIDs._BloomParams, Vector4.zero);
+                cmd.SetComputeVectorParam(cs, HDShaderIDs._LogLut3D_Params, Vector4.zero);
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._LogLut3D, m_InternalLogLut);
+                cmd.SetComputeVectorParam(cs, "_DebugFlags", Vector4.zero);
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._InputTexture, source);
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._OutputTexture, destination);
+                cmd.DispatchCompute(cs, kernel, (camera.actualWidth + 7) / 8, (camera.actualHeight + 7) / 8, camera.viewCount);
+
+                PoolSource(ref source, destination);
+            }
+        }
+
+        public void RenderChromaticAberration(CommandBuffer cmd, HDCamera camera, RTHandle colorBuffer, ref RTHandle source, bool taaEnabled, bool isSceneView)
+        {
+            if (m_ChromaticAberration.IsActive())
+            {
+                void PoolSource(ref RTHandle src, RTHandle dst)
+                {
+                    PoolSourceGuard(ref src, dst, colorBuffer);
+                }
+
+                var cs = m_Resources.shaders.uberPostCS;
+                int kernel = GetUberKernel(cs, UberPostFeatureFlags.ChromaticAberration);
+
+                DoChromaticAberration(cmd, cs, kernel, UberPostFeatureFlags.ChromaticAberration);
+
+                // Run
+                var destination = m_Pool.Get(Vector2.one, k_ColorFormat);
+
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._BloomTexture, TextureXR.GetBlackTexture());
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._BloomDirtTexture, Texture2D.blackTexture);
+                cmd.SetComputeVectorParam(cs, HDShaderIDs._BloomParams, Vector4.zero);
+                cmd.SetComputeVectorParam(cs, HDShaderIDs._LogLut3D_Params, Vector4.zero);
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._LogLut3D, m_InternalLogLut);
+                cmd.SetComputeVectorParam(cs, "_DebugFlags", Vector4.zero);
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._InputTexture, source);
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._OutputTexture, destination);
+                cmd.DispatchCompute(cs, kernel, (camera.actualWidth + 7) / 8, (camera.actualHeight + 7) / 8, camera.viewCount);
+
+                PoolSource(ref source, destination);
+            }
+        }
+
+        public void RenderVignette(CommandBuffer cmd, HDCamera camera, RTHandle colorBuffer, ref RTHandle source, bool taaEnabled, bool isSceneView)
+        {
+            if (m_Vignette.IsActive())
+            {
+
+                void PoolSource(ref RTHandle src, RTHandle dst)
+                {
+                    PoolSourceGuard(ref src, dst, colorBuffer);
+                }
+
+                var cs = m_Resources.shaders.uberPostCS;
+                int kernel = GetUberKernel(cs, UberPostFeatureFlags.Vignette);
+
+                DoVignette(cmd, cs, kernel, UberPostFeatureFlags.Vignette);
+
+                // Run
+                var destination = m_Pool.Get(Vector2.one, k_ColorFormat);
+
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._BloomTexture, TextureXR.GetBlackTexture());
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._BloomDirtTexture, Texture2D.blackTexture);
+                cmd.SetComputeVectorParam(cs, HDShaderIDs._BloomParams, Vector4.zero);
+                cmd.SetComputeVectorParam(cs, HDShaderIDs._LogLut3D_Params, Vector4.zero);
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._LogLut3D, m_InternalLogLut);
+                cmd.SetComputeVectorParam(cs, "_DebugFlags", Vector4.zero);
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._InputTexture, source);
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._OutputTexture, destination);
+                cmd.DispatchCompute(cs, kernel, (camera.actualWidth + 7) / 8, (camera.actualHeight + 7) / 8, camera.viewCount);
+
+                PoolSource(ref source, destination);
+            }
+        }
+
+        public void RenderColorGrading(CommandBuffer cmd, HDCamera camera, RTHandle colorBuffer, ref RTHandle source, bool taaEnabled, bool isSceneView)
+        {
+            void PoolSource(ref RTHandle src, RTHandle dst)
+            {
+                PoolSourceGuard(ref src, dst, colorBuffer);
+            }
+
+            var cs = m_Resources.shaders.uberPostCS;
+            var featureFlags = GetUberFeatureFlags(isSceneView);
+            int kernel = GetUberKernel(cs, UberPostFeatureFlags.None);
+
+            cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._BloomTexture, TextureXR.GetBlackTexture());
+            cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._BloomDirtTexture, Texture2D.blackTexture);
+            cmd.SetComputeVectorParam(cs, HDShaderIDs._BloomParams, Vector4.zero);
+
+            // Build the color grading lut
+            using (new ProfilingSample(cmd, "Color Grading LUT Builder", CustomSamplerId.ColorGradingLUTBuilder.GetSampler()))
+            {
+                DoColorGrading(cmd, cs, kernel);
+            }
+            
+            // Run
+            var destination = m_Pool.Get(Vector2.one, k_ColorFormat);
+            
+            bool outputColorLog = m_HDInstance.m_CurrentDebugDisplaySettings.data.fullScreenDebugMode == FullScreenDebugMode.ColorLog;
+            cmd.SetComputeVectorParam(cs, "_DebugFlags", new Vector4(outputColorLog ? 1 : 0, 0, 0, 0));
+            cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._InputTexture, source);
+            cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._OutputTexture, destination);
+            cmd.DispatchCompute(cs, kernel, (camera.actualWidth + 7) / 8, (camera.actualHeight + 7) / 8, camera.viewCount);
+            m_HDInstance.PushFullScreenDebugTexture(camera, cmd, destination, FullScreenDebugMode.ColorLog);
+            
+            PoolSource(ref source, destination);
+        }
+
+        public void RenderBloom(CommandBuffer cmd, HDCamera camera, RTHandle colorBuffer, ref RTHandle source, bool taaEnabled, bool isSceneView)
+        {
+            void PoolSource(ref RTHandle src, RTHandle dst)
+            {
+                PoolSourceGuard(ref src, dst, colorBuffer);
+            }
+
+            var cs = m_Resources.shaders.uberPostCS;
+            int kernel = GetUberKernel(cs, UberPostFeatureFlags.None);
+
+            // Generate the bloom texture
+            bool bloomActive = m_Bloom.IsActive() && m_BloomFS;
+
+            if (bloomActive)
+            {
+                using (new ProfilingSample(cmd, "Bloom", CustomSamplerId.Bloom.GetSampler()))
+                {
+                    DoBloom(cmd, camera, source, cs, kernel);
+                }
+
+                // Run
+                var destination = m_Pool.Get(Vector2.one, k_ColorFormat);
+
+
+                cmd.SetComputeVectorParam(cs, HDShaderIDs._LogLut3D_Params, Vector4.zero);
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._LogLut3D, m_InternalLogLut);
+                cmd.SetComputeVectorParam(cs, "_DebugFlags", Vector4.zero);
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._InputTexture, source);
+                cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._OutputTexture, destination);
+                cmd.DispatchCompute(cs, kernel, (camera.actualWidth + 7) / 8, (camera.actualHeight + 7) / 8, camera.viewCount);
+
+                // Cleanup
+                if (bloomActive) m_Pool.Recycle(m_BloomTexture);
+                m_BloomTexture = null;
+
+                PoolSource(ref source, destination);
+            }
+        }
+
         public void Render(CommandBuffer cmd, HDCamera camera, BlueNoise blueNoise, RTHandle colorBuffer, RTHandle afterPostProcessTexture, RTHandle lightingBuffer, RenderTargetIdentifier finalRT, RTHandle depthBuffer, bool flipY)
         {
             var dynResHandler = DynamicResolutionHandler.instance;
@@ -474,96 +737,13 @@ namespace UnityEngine.Rendering.HighDefinition
                         }
                     }
 
-                    // Depth of Field is done right after TAA as it's easier to just re-project the CoC
-                    // map rather than having to deal with all the implications of doing it before TAA
-                    if (m_DepthOfField.IsActive() && !isSceneView && m_DepthOfFieldFS)
+                    // Call the Post Processes in the order of the List
+                    foreach (var ppCmd in m_ReorderableCommands)
                     {
-                        using (new ProfilingSample(cmd, "Depth of Field", CustomSamplerId.DepthOfField.GetSampler()))
+                        using (new ProfilingSample(cmd, ppCmd.name, CustomSamplerId.PostProcessing.GetSampler()))
                         {
-                            var destination = m_Pool.Get(Vector2.one, k_ColorFormat);
-                            DoDepthOfField(cmd, camera, source, destination, taaEnabled);
-                            PoolSource(ref source, destination);
+                            ppCmd.command(cmd, camera, colorBuffer, ref source, taaEnabled, isSceneView);
                         }
-                    }
-
-                    // Motion blur after depth of field for aesthetic reasons (better to see motion
-                    // blurred bokeh rather than out of focus motion blur)
-                    if (m_MotionBlur.IsActive() && m_AnimatedMaterialsEnabled && !m_ResetHistory && m_MotionBlurFS)
-                    {
-                        using (new ProfilingSample(cmd, "Motion Blur", CustomSamplerId.MotionBlur.GetSampler()))
-                        {
-                            var destination = m_Pool.Get(Vector2.one, k_ColorFormat);
-                            DoMotionBlur(cmd, camera, source, destination);
-                            PoolSource(ref source, destination);
-                        }
-                    }
-
-                    // Panini projection is done as a fullscreen pass after all depth-based effects are
-                    // done and before bloom kicks in
-                    // This is one effect that would benefit from an overscan mode or supersampling in
-                    // HDRP to reduce the amount of resolution lost at the center of the screen
-                    if (m_PaniniProjection.IsActive() && !isSceneView && m_PaniniProjectionFS)
-                    {
-                        using (new ProfilingSample(cmd, "Panini Projection", CustomSamplerId.PaniniProjection.GetSampler()))
-                        {
-                            var destination = m_Pool.Get(Vector2.one, k_ColorFormat);
-                            DoPaniniProjection(cmd, camera, source, destination);
-                            PoolSource(ref source, destination);
-                        }
-                    }
-
-                    // Combined post-processing stack - always runs if postfx is enabled
-                    using (new ProfilingSample(cmd, "Uber", CustomSamplerId.UberPost.GetSampler()))
-                    {
-                        // Feature flags are passed to all effects and it's their responsibility to check
-                        // if they are used or not so they can set default values if needed
-                        var cs = m_Resources.shaders.uberPostCS;
-                        var featureFlags = GetUberFeatureFlags(isSceneView);
-                        int kernel = GetUberKernel(cs, featureFlags);
-
-                        // Generate the bloom texture
-                        bool bloomActive = m_Bloom.IsActive() && m_BloomFS;
-
-                        if (bloomActive)
-                        {
-                            using (new ProfilingSample(cmd, "Bloom", CustomSamplerId.Bloom.GetSampler()))
-                            {
-                                DoBloom(cmd, camera, source, cs, kernel);
-                            }
-                        }
-                        else
-                        {
-                            cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._BloomTexture, TextureXR.GetBlackTexture());
-                            cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._BloomDirtTexture, Texture2D.blackTexture);
-                            cmd.SetComputeVectorParam(cs, HDShaderIDs._BloomParams, Vector4.zero);
-                        }
-
-                        // Build the color grading lut
-                        using (new ProfilingSample(cmd, "Color Grading LUT Builder", CustomSamplerId.ColorGradingLUTBuilder.GetSampler()))
-                        {
-                            DoColorGrading(cmd, cs, kernel);
-                        }
-
-                        // Setup the rest of the effects
-                        DoLensDistortion(cmd, cs, kernel, featureFlags);
-                        DoChromaticAberration(cmd, cs, kernel, featureFlags);
-                        DoVignette(cmd, cs, kernel, featureFlags);
-
-                        // Run
-                        var destination = m_Pool.Get(Vector2.one, k_ColorFormat);
-
-                        bool outputColorLog = m_HDInstance.m_CurrentDebugDisplaySettings.data.fullScreenDebugMode == FullScreenDebugMode.ColorLog;
-                        cmd.SetComputeVectorParam(cs, "_DebugFlags", new Vector4(outputColorLog ? 1 : 0, 0, 0, 0));
-                        cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._InputTexture, source);
-                        cmd.SetComputeTextureParam(cs, kernel, HDShaderIDs._OutputTexture, destination);
-                        cmd.DispatchCompute(cs, kernel, (camera.actualWidth + 7) / 8, (camera.actualHeight + 7) / 8, camera.viewCount);
-                        m_HDInstance.PushFullScreenDebugTexture(camera, cmd, destination, FullScreenDebugMode.ColorLog);
-
-                        // Cleanup
-                        if (bloomActive) m_Pool.Recycle(m_BloomTexture);
-                        m_BloomTexture = null;
-
-                        PoolSource(ref source, destination);
                     }
 
                     if (camera.frameSettings.IsEnabled(FrameSettingsField.CustomPostProcess))
